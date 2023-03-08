@@ -2,8 +2,10 @@ use std::ffi::{c_void, CStr};
 use std::future;
 use std::pin::Pin;
 use std::ptr;
+use std::sync::{Arc, Weak};
 use std::task::{Context, Poll};
 
+use tokio::sync::oneshot::error::TryRecvError;
 use tokio::sync::oneshot::{channel, Receiver, Sender};
 
 use crate::{check_status, sys, Error, JsUnknown, NapiValue, Result, Status};
@@ -12,6 +14,7 @@ use super::{FromNapiValue, TypeName, ValidateNapiValue};
 
 pub struct Promise<T: FromNapiValue> {
   value: Pin<Box<Receiver<*mut Result<T>>>>,
+  rx_strong: Arc<()>
 }
 
 impl<T: FromNapiValue> TypeName for Promise<T> {
@@ -90,7 +93,9 @@ impl<T: FromNapiValue> FromNapiValue for Promise<T> {
     let mut promise_after_then = ptr::null_mut();
     let mut then_js_cb = ptr::null_mut();
     let (tx, rx) = channel();
-    let tx_ptr = Box::into_raw(Box::new(tx));
+    let rx_strong = Arc::new(());
+    let rx_weak = Arc::downgrade(&rx_strong);
+    let tx_ptr = Box::into_raw(Box::new((tx, rx_weak)));
     check_status!(
       unsafe {
         sys::napi_create_function(
@@ -154,6 +159,7 @@ impl<T: FromNapiValue> FromNapiValue for Promise<T> {
     )?;
     Ok(Promise {
       value: Box::pin(rx),
+      rx_strong
     })
   }
 }
@@ -169,6 +175,13 @@ impl<T: FromNapiValue> future::Future for Promise<T> {
           .and_then(|v| unsafe { *Box::from_raw(v) }.map_err(Error::from)),
       ),
     }
+  }
+}
+
+impl<T: FromNapiValue> Drop for Promise<T> {
+  fn drop(&mut self) {
+    assert_eq!(self.value.try_recv().unwrap_err(), TryRecvError::Empty);
+    println!("Promise got dropped");
   }
 }
 
@@ -194,7 +207,12 @@ unsafe extern "C" fn then_callback<T: FromNapiValue>(
     "Get callback info from Promise::then failed"
   );
   let resolve_value_t = Box::new(unsafe { T::from_napi_value(env, resolved_value[0]) });
-  let sender = unsafe { Box::from_raw(data as *mut Sender<*mut Result<T>>) };
+  let tuple = unsafe { Box::from_raw(data as *mut (Sender<*mut Result<T>>, Weak<()>)) };
+  let sender = tuple.0;
+  let rx_weak = tuple.1;
+  if rx_weak.upgrade().is_none() {
+    return this;
+  }
   sender
     .send(Box::into_raw(resolve_value_t))
     .expect("Send Promise resolved value error");
@@ -224,7 +242,15 @@ unsafe extern "C" fn catch_callback<T: FromNapiValue>(
     "Get callback info from Promise::catch failed"
   );
   let rejected_value = rejected_value[0];
-  let sender = unsafe { Box::from_raw(data as *mut Sender<*mut Result<T>>) };
+  // let sender = unsafe { Box::from_raw(data as *mut Sender<*mut Result<T>>) };
+  let tuple = unsafe { Box::from_raw(data as *mut (Sender<*mut Result<T>>, Weak<()>)) };
+  let sender = tuple.0;
+  let rx_weak = tuple.1;
+
+  if rx_weak.upgrade().is_none() {
+    return this;
+  }
+
   sender
     .send(Box::into_raw(Box::new(Err(Error::from(unsafe {
       JsUnknown::from_raw_unchecked(env, rejected_value)
